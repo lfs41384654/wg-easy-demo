@@ -1,0 +1,35 @@
+name: wg-debug3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: exec battery inside real image
+        run: |
+          set +e
+          docker pull -q ghcr.io/wg-easy/wg-easy:14
+          docker run -d --name wgd --privileged \
+            --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
+            --sysctl="net.ipv4.ip_forward=1" \
+            --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 900' >/dev/null
+          sleep 4
+          echo "=== id ==="; docker exec wgd id
+          echo "=== ls ==="; docker exec wgd ls -l /usr/bin/readlink /bin/busybox /usr/bin/wg-quick 2>&1
+          echo "=== mount flags ==="; docker exec wgd sh -c 'mount | grep -E "on / |on /usr|on /bin" | head -5'
+          echo "=== readlink plain ==="; docker exec wgd readlink -f / 2>&1; echo rc=$?
+          echo "=== readlink abs ==="; docker exec wgd /usr/bin/readlink -f / 2>&1; echo rc=$?
+          echo "=== busybox applet ==="; docker exec wgd /bin/busybox readlink -f / 2>&1; echo rc=$?
+          echo "=== env ==="; docker exec wgd env | sort | head -20
+          echo "=== conf+direct wg-quick ==="
+          docker exec wgd sh -c 'mkdir -p /etc/wireguard && umask 077 && printf "[Interface]\nAddress = 10.8.0.1/24\nListenPort = 51820\nPrivateKey = %s\n" "$(wg genkey)" > /etc/wireguard/wg0.conf && wg-quick up wg0' 2>&1 | tail -12
+          echo "=== wg show after direct ==="; docker exec wgd wg show 2>&1 | head -6
+          echo "=== bash -x path ==="; docker exec wgd bash -x /usr/bin/wg-quick up wg0 2>&1 | head -6
+          echo "=== try PATH-independent copy ==="
+          docker exec wgd sh -c 'cp /bin/busybox /tmp/bbrl && ln -sf /tmp/bbrl /tmp/readlink && /tmp/readlink -f /' 2>&1; echo rc=$?
+          echo "=== seccomp/apparmor ==="; docker exec wgd sh -c 'cat /proc/self/status | grep -E "Seccomp|CapEff"'
+          docker rm -f wgd >/dev/null 2>&1
+          echo "DONE"
