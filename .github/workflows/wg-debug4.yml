@@ -1,0 +1,48 @@
+name: wg-debug4
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: probe call chain
+        run: |
+          set +e
+          docker pull -q ghcr.io/wg-easy/wg-easy:14
+          docker run -d --name wgd --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 900' >/dev/null
+          sleep 4
+          echo "=== shells ==="
+          docker exec wgd ls -l /bin/bash /bin/sh /bin/ash 2>&1
+          echo "=== shebang ==="
+          docker exec wgd head -1 /usr/bin/wg-quick
+          echo "=== readlink variants ==="
+          docker exec wgd bash -c 'readlink -f /'; echo "bash_c rc=$?"
+          docker exec wgd sh -c 'readlink -f /';   echo "sh_c rc=$?"
+          docker exec wgd bash -c '/usr/bin/readlink -f /'; echo "bash_abs rc=$?"
+          echo "=== line 40-50 ==="
+          docker exec wgd sed -n '40,50p' /usr/bin/wg-quick
+          echo "=== which bash ==="
+          docker exec wgd sh -c 'command -v bash; bash --version | head -1'
+          echo "=== try wg-quick via bash explicitly ==="
+          docker exec wgd sh -c 'mkdir -p /etc/wireguard && umask 077 && printf "[Interface]\nAddress = 10.8.0.1/24\nListenPort = 51820\nPrivateKey = %s\n" "$(wg genkey)" > /etc/wireguard/wg0.conf'
+          docker exec wgd bash /usr/bin/wg-quick up wg0 2>&1 | tail -8; echo "explicit_bash rc=$?"
+          docker exec wgd wg show 2>&1 | head -5
+          docker rm -f wgd >/dev/null 2>&1
+
+      - name: probe v15 image
+        run: |
+          set +e
+          echo "=== pull v15 ==="
+          docker pull -q ghcr.io/wg-easy/wg-easy:15 2>&1 | tail -2
+          docker run -d --name wg15 --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:15 -c 'sleep 900' >/dev/null 2>&1 || { echo "v15 no sh"; docker run -d --name wg15 --privileged ghcr.io/wg-easy/wg-easy:15; }
+          sleep 5
+          echo "=== v15 shells ==="
+          docker logs wg15 2>&1 | head -10
+          echo "=== v15 wg test ==="
+          docker exec wg15 sh -c 'mkdir -p /etc/wireguard && umask 077 && printf "[Interface]\nAddress = 10.8.0.1/24\nListenPort = 51820\nPrivateKey = %s\n" "$(wg genkey)" > /etc/wireguard/wg0.conf && wg-quick up wg0' 2>&1 | tail -10
+          docker exec wg15 wg show 2>&1 | head -6
+          docker rm -f wg15 >/dev/null 2>&1
+          echo DONE
