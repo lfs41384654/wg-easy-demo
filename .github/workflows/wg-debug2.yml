@@ -1,0 +1,57 @@
+name: wg-debug2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: readlink matrix
+        run: |
+          set +e
+          docker pull -q ghcr.io/wg-easy/wg-easy:14
+          run() { echo "### $1"; shift; docker run --rm "$@" 2>&1 | head -8; echo "rc=$?"; echo; }
+
+          run "alpine plain readlink"        alpine sh -c 'id; /usr/bin/readlink -f / ; echo inner_rc=$?'
+          run "alpine privileged readlink"   --privileged alpine sh -c '/usr/bin/readlink -f /; echo inner_rc=$?'
+          run "wgeasy plain"                 ghcr.io/wg-easy/wg-easy:14 sh -c 'id; /usr/bin/readlink -f /; echo inner_rc=$?'
+          run "wgeasy privileged"            --privileged ghcr.io/wg-easy/wg-easy:14 sh -c 'id; /usr/bin/readlink -f /; echo inner_rc=$?'
+          run "wgeasy priv+unconfined"       --privileged --security-opt seccomp=unconfined --security-opt apparmor=unconfined ghcr.io/wg-easy/wg-easy:14 sh -c 'id; /usr/bin/readlink -f /; echo inner_rc=$?'
+
+      - name: wg-quick script head
+        run: |
+          set +e
+          echo "=== wg-quick first 20 lines ==="
+          docker run --rm ghcr.io/wg-easy/wg-easy:14 sh -c 'head -20 /usr/bin/wg-quick; echo ---; ls -l /bin/busybox; file /bin/busybox 2>/dev/null; echo ---; mount | grep -E " / | /usr " | head -5'
+
+      - name: real wg test privileged
+        run: |
+          set +e
+          docker run --rm --privileged ghcr.io/wg-easy/wg-easy:14 sh -c '
+            mkdir -p /etc/wireguard
+            wg genkey > /tmp/k
+            printf "[Interface]\nAddress = 10.8.0.1/24\nListenPort = 51820\nPrivateKey = %s\n" "$(cat /tmp/k)" > /etc/wireguard/wg0.conf
+            echo "--- wg-quick up ---"
+            bash -x /usr/bin/wg-quick up wg0 2>&1 | tail -25
+            echo "--- wg show ---"
+            wg show 2>&1
+            echo "--- manual ip ---"
+            ip link add wgtest type wireguard 2>&1; echo rc=$?
+            ip link del wgtest 2>/dev/null
+          '
+
+      - name: host capability check
+        run: |
+          set +e
+          echo "=== host: can we do it directly? ==="
+          sudo apt-get install -y -qq wireguard-tools iptables >/dev/null 2>&1
+          sudo modprobe wireguard; echo "modprobe rc=$?"
+          sudo ip link add wghost type wireguard 2>&1; echo "host add rc=$?"
+          sudo ip link del wghost 2>/dev/null
+          echo "--- host iptables nat ---"
+          sudo iptables -t nat -L -n 2>&1 | head -3; echo "rc=$?"
+          echo "--- host nft ---"
+          sudo nft list tables 2>&1 | head -3; echo "rc=$?"
+          echo "--- kernel ---"; uname -r
