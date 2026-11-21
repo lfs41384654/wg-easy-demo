@@ -17,17 +17,13 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y -qq wireguard-tools jq iptables
-          echo "=== load kernel modules on host ==="
-          for m in wireguard ip_tables iptable_nat iptable_filter ip6table_nat xt_nat xt_MASQUERADE xt_comment xt_conntrack nf_nat; do
+          sudo apt-get install -y -qq wireguard-tools jq curl
+          for m in wireguard ip_tables iptable_nat iptable_filter xt_nat xt_MASQUERADE xt_conntrack nf_nat; do
             sudo modprobe $m 2>/dev/null && echo "ok $m" || echo "skip $m"
           done
-          echo "=== host iptables variant ==="
-          sudo iptables -V
-          sudo iptables -t nat -L -n >/dev/null 2>&1 && echo "host nat: OK" || echo "host nat: FAIL"
-          ls /lib/modules/
           sudo curl -sL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
           sudo docker pull -q ghcr.io/wg-easy/wg-easy:14
 
       - name: open public tunnel first
@@ -40,13 +36,13 @@ jobs:
             [ -n "$URL" ] && break
             sleep 2
           done
-          [ -n "$URL" ] || { echo "TUNNEL_FAIL"; cat /tmp/cf.log; exit 1; }
+          [ -n "$URL" ] || { echo TUNNEL_FAIL; cat /tmp/cf.log; exit 1; }
           HOST=${URL#https://}
           echo "TUNNEL_URL=$URL" >> "$GITHUB_ENV"
           echo "WG_HOST=$HOST" >> "$GITHUB_ENV"
           echo "public url: $URL"
 
-      - name: start wg-easy (privileged + modules)
+      - name: start wg-easy
         run: |
           set -e
           PW='DemoWG2026'
@@ -55,13 +51,13 @@ jobs:
                  -e "console.log(require('bcryptjs').hashSync(process.argv[1],10))" "$PW")
           echo "hash len: ${#HASH}"
           sudo docker run -d --name wg-easy --privileged \
-            -v /lib/modules:/lib/modules:ro \
             -e "WG_HOST=$WG_HOST" \
             -e "PASSWORD_HASH=$HASH" \
             -e WG_PORT=51820 \
             -e WG_DEFAULT_ADDRESS=10.8.0.x \
             -e WG_DEFAULT_DNS=1.1.1.1 \
             -e WG_ALLOWED_IPS=0.0.0.0/0,::/0 \
+            -e WG_MTU=1280 \
             -p 51821:51821/tcp \
             -p 51820:51820/udp \
             --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
@@ -74,25 +70,19 @@ jobs:
             if [ "$code" = "200" ]; then ok=1; break; fi
             sleep 3
           done
-          echo "=== container logs ==="
-          sudo docker logs wg-easy 2>&1 | tail -25
-          echo "=== wg show ==="
-          sudo docker exec wg-easy wg show 2>&1 | head -20 || true
-          echo "=== ip link ==="
-          sudo docker exec wg-easy ip -brief addr 2>&1 | head -10 || true
-          [ "$ok" = "1" ] || { echo "WG_EASY_HTTP_FAIL"; exit 1; }
+          echo "=== container logs ==="; sudo docker logs wg-easy 2>&1 | tail -20
+          echo "=== wg show ==="; sudo docker exec wg-easy wg show 2>&1 | head -20 || true
+          [ "$ok" = "1" ] || { echo WG_EASY_HTTP_FAIL; exit 1; }
 
       - name: create demo client via API
         run: |
           set -e
           BASE=http://127.0.0.1:51821
           J=/tmp/cj.txt
-          curl -s -c $J -X POST "$BASE/api/session" \
-            -H 'Content-Type: application/json' \
+          curl -s -c $J -X POST "$BASE/api/session" -H 'Content-Type: application/json' \
             -d "{\"password\":\"$WG_UI_PASSWORD\"}" -o /tmp/login.json -w 'login http=%{http_code}\n'
           head -c 200 /tmp/login.json; echo
-          curl -s -b $J -X POST "$BASE/api/wireguard/client" \
-            -H 'Content-Type: application/json' \
+          curl -s -b $J -X POST "$BASE/api/wireguard/client" -H 'Content-Type: application/json' \
             -d '{"name":"demo-phone"}' -o /tmp/client.json -w 'create http=%{http_code}\n'
           head -c 300 /tmp/client.json; echo
           CID=$(jq -r '.id' /tmp/client.json)
@@ -114,7 +104,7 @@ jobs:
             echo "| 保活 | ${{ github.event.inputs.minutes }} 分钟 |"
             echo ""
             echo '```'
-            cat /tmp/demo-phone.conf 2>/dev/null || echo "(config not generated)"
+            cat /tmp/demo-phone.conf 2>/dev/null || echo "(no config)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "UI: $TUNNEL_URL  pw: $WG_UI_PASSWORD"
@@ -122,7 +112,7 @@ jobs:
           for m in $(seq 1 "$H"); do
             sleep 60
             if [ $((m % 5)) = 0 ]; then
-              echo "[${m}/${H}min] peers:"; sudo docker exec wg-easy wg show 2>&1 | head -8 || true
+              echo "[${m}/${H}min]"; sudo docker exec wg-easy wg show 2>&1 | head -8 || true
             fi
           done
 
