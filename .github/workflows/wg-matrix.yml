@@ -1,0 +1,71 @@
+name: wg-matrix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  m:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: prep
+        run: |
+          set -e
+          sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools jq >/dev/null 2>&1
+          sudo modprobe wireguard; sudo modprobe iptable_nat || true
+          sudo docker pull -q ghcr.io/wg-easy/wg-easy:14
+          cp /usr/bin/wg-quick /tmp/wq
+          chmod 777 /tmp/wq
+          sed -i 's|^SELF=.*readlink.*$|SELF="/usr/bin/wg-quick"|' /tmp/wq
+          sed -i '/CONFIG_FILE="\$(readlink -f/d' /tmp/wq
+          sed -i '/stat -c .0%#a./d' /tmp/wq
+          grep -c readlink /tmp/wq || true
+
+      - name: matrix
+        run: |
+          set +e
+          PW=DemoWG2026
+          HASH=$(sudo docker run --rm --entrypoint node ghcr.io/wg-easy/wg-easy:14 -e "console.log(require('bcryptjs').hashSync(process.argv[1],10))" "$PW")
+          try() {
+            NAME=$1; shift
+            echo "########## $NAME : $*"
+            sudo docker rm -f "$NAME" >/dev/null 2>&1
+            sudo docker run -d --name "$NAME" "$@" \
+              -v /tmp/wq:/usr/bin/wg-quick:ro \
+              -e "WG_HOST=demo.example.com" -e "PASSWORD_HASH=$HASH" \
+              -e WG_DEFAULT_DNS=1.1.1.1 -e WG_MTU=1280 \
+              -p 51821:51821/tcp -p 51820:51820/udp \
+              ghcr.io/wg-easy/wg-easy:14 >/dev/null
+            for i in $(seq 1 15); do
+              c=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:51821/ 2>/dev/null)
+              [ "$c" = "200" ] && break
+              sleep 2
+            done
+            echo "HTTP=$c"
+            sudo docker logs "$NAME" 2>&1 | grep -aE "Permission denied|ip: |Error|listening|Server|Unable" | tail -6
+            echo "status=$(sudo docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null)"
+            sudo docker rm -f "$NAME" >/dev/null 2>&1
+            echo
+          }
+
+          try v1 --privileged --security-opt apparmor=unconfined --security-opt seccomp=unconfined
+          try v2 --privileged --security-opt apparmor=unconfined --security-opt seccomp=unconfined --user 0:0
+          try v3 --privileged
+
+      - name: atoll
+        if: always()
+        run: |
+          echo "atoll: inspect perms"
+          HASH=x
+          docker run -d --name p1 --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 300' >/dev/null
+          sleep 3
+          docker exec p1 sh -c 'ls -ld /sbin /usr/bin /bin; ls -l /sbin/ip; id; echo ---; /sbin/ip -V; echo rc=$?'
+          echo "=== proc1 uid (in real container) ==="
+          docker rm -f p1 >/dev/null 2>&1
+          docker run -d --name p2 --privileged -v /tmp/wq:/usr/bin/wg-quick:ro -e WG_HOST=x -e PASSWORD_HASH='$2a$10$abcdefghijklmnopqrstuv' ghcr.io/wg-easy/wg-easy:14 >/dev/null
+          sleep 12
+          echo "--- docker top ---"; docker top p2 2>&1 | head -5
+          echo "--- exec id ---"; docker exec p2 id 2>&1
+          echo "--- exec ip ---"; docker exec p2 /sbin/ip -V 2>&1; echo rc=$?
+          echo "--- exec as node ---"; docker exec -u node p2 /sbin/ip -V 2>&1; echo rc=$?
+          docker rm -f p2 >/dev/null 2>&1
