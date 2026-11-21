@@ -1,0 +1,78 @@
+name: wg-patch2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: build patched script
+        run: |
+          set -e
+          docker pull -q ghcr.io/wg-easy/wg-easy:14 >/dev/null
+          docker run -d --name tmp --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 30' >/dev/null
+          sleep 3
+          docker cp tmp:/usr/bin/wg-quick /tmp/wq-new
+          docker rm -f tmp >/dev/null 2>&1
+          sed -i 's|^SELF=.*readlink.*$|SELF="/usr/bin/wg-quick"|' /tmp/wq-new
+          sed -i 's|^\s*CONFIG_FILE="\$(readlink -f "\$CONFIG_FILE")"\s*$|\tCONFIG_FILE="$CONFIG_FILE"|' /tmp/wq-new
+          sed -i 's|^\s*(((.*stat -c .*$|\t: # perm check removed|' /tmp/wq-new
+          grep -n 'readlink\|stat -c' /tmp/wq-new || echo "(none) clean"
+          echo "size=$(stat -c %s /tmp/wq-new)"
+
+      - name: A bind-mount script (previous approach)
+        run: |
+          set +e
+          docker run -d --name tA --privileged -v /tmp/wq-new:/usr/bin/wg-quick:ro --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 300' >/dev/null
+          sleep 3
+          docker exec tA sh -c 'mkdir -p /etc/wireguard && umask 077 && printf "[Interface]\nAddress = 10.8.0.1/24\nListenPort = 51820\nPrivateKey = %s\n" "$(wg genkey)" > /etc/wireguard/wg0.conf'
+          echo "--- node exec wg-quick (bind mount) ---"
+          docker exec tA node -e "try{console.log(require('child_process').execSync('wg-quick up wg0').toString())}catch(e){console.log('ERR',e.status,e.message.split('\n').slice(0,3).join('|'))}"
+          docker rm -f tA >/dev/null 2>&1
+
+      - name: B docker cp script (in-image)
+        run: |
+          set +e
+          docker run -d --name tB --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 300' >/dev/null
+          sleep 3
+          docker cp /tmp/wq-new tB:/usr/bin/wg-quick
+          docker exec tB chmod 755 /usr/bin/wg-quick
+          docker exec tB sh -c 'mkdir -p /etc/wireguard && umask 077 && printf "[Interface]\nAddress = 10.8.0.1/24\nListenPort = 51820\nPrivateKey = %s\n" "$(wg genkey)" > /etc/wireguard/wg0.conf'
+          echo "--- node exec wg-quick (in-image) ---"
+          docker exec tB node -e "try{console.log(require('child_process').execSync('wg-quick up wg0').toString())}catch(e){console.log('ERR',e.status,e.message.split('\n').slice(0,3).join('|'))}"
+          echo "--- wg show ---"
+          docker exec tB wg show 2>&1 | head -6
+          echo "--- node exec ip direct ---"
+          docker exec tB node -e "console.log(require('child_process').execSync('/sbin/ip link show wg0').toString().split('\n')[0])"
+          docker rm -f tB >/dev/null 2>&1
+
+      - name: C full wg-easy with in-image patch
+        run: |
+          set +e
+          PW=DemoWG2026
+          HASH=$(docker run --rm --entrypoint node ghcr.io/wg-easy/wg-easy:14 -e "console.log(require('bcryptjs').hashSync(process.argv[1],10))" "$PW")
+          docker rm -f wgC >/dev/null 2>&1
+          # 先起一个真实容器，把补丁写进镜像层
+          docker run -d --name wgC --privileged \
+            -e "WG_HOST=demo.example.com" -e "PASSWORD_HASH=$HASH" \
+            -e WG_DEFAULT_DNS=1.1.1.1 -e WG_MTU=1280 \
+            -p 51821:51821/tcp ghcr.io/wg-easy/wg-easy:14 >/dev/null
+          sleep 8
+          echo "--- status after first boot ---"
+          docker inspect -f '{{.State.Status}}' wgC
+          docker logs wgC 2>&1 | tail -6
+          # 打完补丁重启
+          docker cp /tmp/wq-new wgC:/usr/bin/wg-quick 2>&1
+          docker exec wgC chmod 755 /usr/bin/wg-quick 2>&1
+          docker restart wgC >/dev/null
+          sleep 20
+          echo "--- status after patch+restart: $(docker inspect -f '{{.State.Status}}' wgC) ---"
+          docker logs wgC 2>&1 | tail -12
+          echo "--- HTTP ---"
+          echo "http=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:51821/)"
+          echo "--- wg show ---"
+          docker exec wgC wg show 2>&1 | head -8
+          docker rm -f wgC >/dev/null 2>&1
+          echo PATCH2_DONE
