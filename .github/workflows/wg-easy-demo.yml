@@ -26,12 +26,17 @@ jobs:
           cloudflared --version
           sudo docker pull -q ghcr.io/wg-easy/wg-easy:14
 
-          # 关键：容器内 wg-quick 的 readlink 解析失败。把 SELF 写死绕过它
+          # 容器内 wg-quick 的 busybox 外部调用（readlink/stat）在 Node 子进程里会 EACCES
+          # 直接把这三处调用裁掉：路径本来就是绝对路径，权限告警只是提示
           cp /usr/bin/wg-quick /tmp/wg-quick-patched
-          sed -i 's|^SELF="\$(readlink -f "\${BASH_SOURCE\[0\]}")"$|SELF="/usr/bin/wg-quick"|' /tmp/wg-quick-patched
-          grep -n '^SELF=' /tmp/wg-quick-patched || { echo "PATCH_FAILED"; exit 1; }
-          chmod 755 /tmp/wg-quick-patched
-          sed -n '9,12p' /tmp/wg-quick-patched
+          chmod 777 /tmp/wg-quick-patched
+          sed -i 's|^SELF=.*readlink.*$|SELF="/usr/bin/wg-quick"|' /tmp/wg-quick-patched
+          sed -i '/CONFIG_FILE="\$(readlink -f/d' /tmp/wg-quick-patched
+          sed -i '/stat -c .0%#a./d' /tmp/wg-quick-patched
+          echo "=== remaining readlink/stat refs ==="
+          grep -n 'readlink\|stat -c' /tmp/wg-quick-patched || echo "(none) OK"
+          grep -n '^SELF=' /tmp/wg-quick-patched || { echo PATCH_FAILED; exit 1; }
+          sed -n '9,12p;44,48p' /tmp/wg-quick-patched
 
       - name: open public tunnel first
         run: |
