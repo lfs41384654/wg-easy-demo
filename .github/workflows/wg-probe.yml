@@ -1,0 +1,37 @@
+name: wg-probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: inspect
+        run: |
+          set +e
+          docker pull -q ghcr.io/wg-easy/wg-easy:14
+          echo "=== image User ==="
+          docker image inspect ghcr.io/wg-easy/wg-easy:14 --format 'User={{.Config.User}} Entrypoint={{.Config.Entrypoint}} Cmd={{.Config.Cmd}}'
+          docker run -d --name pr --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 600' >/dev/null
+          sleep 3
+          echo "=== perms ==="
+          docker exec pr sh -c 'ls -l /sbin/ip; stat -c "%a %U %G" /sbin/ip; readlink -f /sbin/ip; mount | grep -E " / | /sbin| /usr" '
+          echo "=== getcap/attr ==="
+          docker exec pr sh -c 'getfattr -d /sbin/ip 2>/dev/null; cat /proc/self/status | grep -iE "NoNewPrivs|Seccomp|CapEff"'
+          echo "=== node as root exec ip ==="
+          docker exec pr node -e "console.log('uid',process.getuid());try{console.log(require('child_process').execSync('/sbin/ip -V').toString())}catch(e){console.log('ERR',e.status,JSON.stringify(e.message))}"
+          echo "=== node with shell:true ==="
+          docker exec pr node -e "try{console.log(require('child_process').execSync('/sbin/ip -V',{shell:'/bin/sh'}).toString())}catch(e){console.log('ERR',e.status,JSON.stringify(e.message))}"
+          echo "=== node exec bash then ip ==="
+          docker exec pr node -e "try{console.log(require('child_process').execSync('/bin/bash -c \"/sbin/ip -V\"').toString())}catch(e){console.log('ERR',e.status,JSON.stringify(e.message))}"
+          echo "=== node exec busybox directly ==="
+          docker exec pr node -e "try{console.log(require('child_process').execSync('/bin/busybox echo hi').toString())}catch(e){console.log('ERR',e.status,JSON.stringify(e.message))}"
+          echo "=== node exec wg ==="
+          docker exec pr node -e "try{console.log(require('child_process').execSync('/usr/bin/wg --version').toString())}catch(e){console.log('ERR',e.status,JSON.stringify(e.message))}"
+          echo "=== strace via node ==="
+          docker exec pr sh -c 'apk add --no-cache strace >/dev/null 2>&1; echo apk_rc=$?'
+          docker exec pr node -e "try{require('child_process').execSync('/usr/bin/strace -f -e trace=execve /sbin/ip -V 2>&1 | tail -5',{shell:'/bin/sh',stdio:'inherit'})}catch(e){console.log('ERR',e.status)}"
+          docker rm -f pr >/dev/null 2>&1
+          echo PROBE_DONE
