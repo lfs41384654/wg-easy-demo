@@ -6,12 +6,12 @@ on:
       minutes:
         description: 'keep alive minutes'
         required: true
-        default: '25'
+        default: '30'
 
 jobs:
   up:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
 
@@ -37,44 +37,31 @@ jobs:
           sudo sh -c 'printf "[Interface]\nAddress = 10.8.0.1/24\nListenPort = 51820\nMTU = 1280\nPrivateKey = %s\n" "$(cat /etc/wireguard/server.key)" > /etc/wireguard/wg0.conf'
           sudo chmod 600 /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
-          echo "=== host wg0 ==="
           sudo wg show
-          sudo ip -brief addr show wg0
           echo PREFLIGHT_OK
-
-      - name: open public tunnel
-        run: |
-          set -e
-          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:51821 > /tmp/cf.log 2>&1 &
-          URL=""
-          for i in $(seq 1 40); do
-            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
-            [ -n "$URL" ] && break
-            sleep 2
-          done
-          [ -n "$URL" ] || { echo TUNNEL_FAIL; cat /tmp/cf.log; exit 1; }
-          HOST=${URL#https://}
-          echo "TUNNEL_URL=$URL" >> "$GITHUB_ENV"
-          echo "WG_HOST=$HOST" >> "$GITHUB_ENV"
-          echo "public url: $URL"
 
       - name: build shim image
         run: |
           set -e
           docker rm -f base >/dev/null 2>&1 || true
-          docker run -d --name base --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 180' >/dev/null
+          docker run -d --name base --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 240' >/dev/null
           sleep 3
           docker cp base:/usr/bin/wg-quick /tmp/wq.real
           sed -i 's|^SELF=.*readlink.*$|SELF="/usr/bin/wg-quick.real"|' /tmp/wq.real
-          sed -i 's|^[ \t]*CONFIG_FILE="$(\readlink -f "\$CONFIG_FILE")"[ \t]*$|\tCONFIG_FILE="$CONFIG_FILE"|' /tmp/wq.real
-          sed -i '/stat -c/ s|^.*$|\t: # perm check removed|' /tmp/wq.real
-          echo "leftover refs: $(grep -c 'readlink\|stat -c' /tmp/wq.real || true)"
+          sed -i '/stat -c/ s|^.*$|\t: # removed|' /tmp/wq.real
+          sed -i 's|^\([ \t]*\)CONFIG_FILE="\$(readlink -f "\(\$CONFIG_FILE\)")"|\1CONFIG_FILE="\2"|' /tmp/wq.real
+          echo "leftover=$(grep -c 'readlink\|stat -c' /tmp/wq.real || true)"
           docker cp /tmp/wq.real base:/usr/bin/wg-quick.real
           docker cp scripts/wg-quick-shim.sh base:/usr/bin/wg-quick
           docker exec base chmod 755 /usr/bin/wg-quick.real /usr/bin/wg-quick
-          echo "--- strip test ---"
-          docker exec base /usr/bin/wg-quick.real strip wg0 2>&1 | head -4 || true
-          docker commit base wgshim:1 >/dev/null && echo "image committed"
+          docker exec base sh -c 'echo "--- strip test ---"; /usr/bin/wg-quick.real strip wg0 2>&1 | head -4' || true
+          # 关键：commit 时把 entrypoint/cmd 恢复成镜像原值
+          docker commit \
+            --change 'ENTRYPOINT ["docker-entrypoint.sh"]' \
+            --change 'CMD ["/usr/bin/dumb-init","node","server.js"]' \
+            base wgshim:1 >/dev/null
+          echo "=== committed config ==="
+          docker image inspect wgshim:1 --format 'Entrypoint={{.Config.Entrypoint}} Cmd={{.Config.Cmd}} User={{.Config.User}}'
           docker rm -f base >/dev/null 2>&1
 
       - name: run wg-easy with host netns
@@ -84,11 +71,10 @@ jobs:
           echo "WG_UI_PASSWORD=$PW" >> "$GITHUB_ENV"
           HASH=$(sudo docker run --rm --entrypoint node wgshim:1 \
                  -e "console.log(require('bcryptjs').hashSync(process.argv[1],10))" "$PW")
-          echo "hash len ${#HASH}"
           sudo docker rm -f wg-easy >/dev/null 2>&1 || true
           sudo docker run -d --name wg-easy --privileged --network=host \
             -v /etc/wireguard:/etc/wireguard \
-            -e "WG_HOST=$WG_HOST" \
+            -e "WG_HOST=localhost" \
             -e "PASSWORD_HASH=$HASH" \
             -e WG_PORT=51820 \
             -e WG_DEFAULT_ADDRESS=10.8.0.x \
@@ -103,29 +89,48 @@ jobs:
             [ "$code" = "200" ] && { ok=1; break; }
             sleep 3
           done
-          echo "=== container logs ==="; sudo docker logs wg-easy 2>&1 | tail -20
+          echo "=== container status ==="
+          sudo docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}}' wg-easy
+          echo "=== container logs ==="; sudo docker logs wg-easy 2>&1 | tail -25
           echo "=== host wg show ==="; sudo wg show 2>&1 | head -12
           [ "$ok" = "1" ] || { echo WG_EASY_HTTP_FAIL; exit 1; }
           echo WG_EASY_UP
 
-      - name: create client through web API
+      - name: open public tunnel
+        run: |
+          set -e
+          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:51821 > /tmp/cf.log 2>&1 &
+          URL=""
+          for i in $(seq 1 40); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          [ -n "$URL" ] || { echo TUNNEL_FAIL; cat /tmp/cf.log; exit 1; }
+          echo "TUNNEL_URL=$URL" >> "$GITHUB_ENV"
+          echo "public url: $URL"
+          echo "=== verify public reachability ==="
+          for i in $(seq 1 15); do
+            c=$(curl -s -o /dev/null -w '%{http_code}' "$URL/" || true)
+            echo "public probe $i -> $c"
+            [ "$c" = "200" ] && break
+            sleep 4
+          done
+
+      - name: create demo client
         run: |
           set -e
           BASE=http://127.0.0.1:51821
           J=/tmp/cj.txt
           curl -s -c $J -X POST "$BASE/api/session" -H 'Content-Type: application/json' \
             -d "{\"password\":\"$WG_UI_PASSWORD\"}" -o /tmp/login.json -w 'login http=%{http_code}\n'
-          head -c 120 /tmp/login.json; echo
           curl -s -b $J -X POST "$BASE/api/wireguard/client" -H 'Content-Type: application/json' \
             -d '{"name":"demo-phone"}' -o /tmp/client.json -w 'create http=%{http_code}\n'
           head -c 200 /tmp/client.json; echo
           CID=$(jq -r '.id' /tmp/client.json)
           curl -s -b $J "$BASE/api/wireguard/client/$CID/configuration" -o /tmp/demo-phone.conf
-          echo "===== CLIENT CONFIG ====="
-          cat /tmp/demo-phone.conf
-          echo "===== END ====="
-          echo "--- peers on host ---"; sudo wg show 2>&1 | head -20
-          echo "--- nat rules ---"; sudo iptables -t nat -S POSTROUTING 2>&1 | head -5
+          echo "===== CLIENT CONFIG ====="; cat /tmp/demo-phone.conf; echo "===== END ====="
+          echo "--- peers ---"; sudo wg show 2>&1 | head -20
 
       - name: keep alive + summary
         run: |
@@ -136,7 +141,6 @@ jobs:
             echo "|---|---|"
             echo "| **Web UI** | $TUNNEL_URL |"
             echo "| 密码 | $WG_UI_PASSWORD |"
-            echo "| WG_HOST | $WG_HOST |"
             echo "| 保活 | ${{ github.event.inputs.minutes }} 分钟 |"
             echo ""
             echo "### demo-phone 客户端配置"
