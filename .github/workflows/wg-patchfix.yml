@@ -1,0 +1,57 @@
+name: wg-patchfix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: build patch and inspect
+        run: |
+          set +e
+          docker pull -q ghcr.io/wg-easy/wg-easy:14
+          docker run -d --name pr --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 900' >/dev/null
+          sleep 3
+          docker cp pr:/usr/bin/wg-quick /tmp/wq-orig
+          echo "=== original line count: $(wc -l < /tmp/wq-orig) ==="
+          echo "=== line 28-40 of orig ==="
+          sed -n '28,40p' /tmp/wq-orig | cat -A | head -20
+
+          cp /tmp/wq-orig /tmp/wq-new
+          echo "=== apply patch A: SELF ==="
+          sed -i 's|^SELF=.*readlink.*$|SELF="/usr/bin/wg-quick"|' /tmp/wq-new
+          echo "=== apply patch B: CONFIG_FILE readlink ==="
+          sed -i 's|^\s*CONFIG_FILE="\$(readlink -f "\$CONFIG_FILE")"\s*$|\tCONFIG_FILE="$CONFIG_FILE"|' /tmp/wq-new
+          echo "=== apply patch C: stat line ==="
+          grep -n 'stat -c' /tmp/wq-new
+          sed -i 's|^\s*(((.*stat -c .*$|\t: # perm check removed|' /tmp/wq-new
+
+          echo "=== DIFF ==="
+          diff /tmp/wq-orig /tmp/wq-new
+          echo "=== remaining refs ==="
+          grep -n 'readlink\|stat -c' /tmp/wq-new || echo "(none)"
+          echo "=== syntax check ==="
+          docker exec pr bash -n /tmp/wq-new 2>&1; echo "syntax rc=$?"
+          sh /tmp/wq-new --help 2>&1 | head -3
+
+      - name: run patched via node in real container
+        run: |
+          set +e
+          PW=DemoWG2026
+          HASH=$(docker run --rm --entrypoint node ghcr.io/wg-easy/wg-easy:14 -e "console.log(require('bcryptjs').hashSync(process.argv[1],10))" "$PW")
+          docker rm -f wgx >/dev/null 2>&1
+          docker run -d --name wgx --privileged \
+            -v /tmp/wq-new:/usr/bin/wg-quick:ro \
+            -e "WG_HOST=demo.example.com" -e "PASSWORD_HASH=$HASH" \
+            -e WG_DEFAULT_DNS=1.1.1.1 -e WG_MTU=1280 \
+            ghcr.io/wg-easy/wg-easy:14 >/dev/null
+          sleep 25
+          echo "=== status ==="; docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' wgx
+          echo "=== logs ==="; docker logs wgx 2>&1 | tail -20
+          echo "=== wg show ==="; docker exec wgx wg show 2>&1 | head -6
+          echo "=== bash -x rerun inside live container ==="
+          docker exec wgx bash -x /usr/bin/wg-quick up wg0 2>&1 | tail -20
+          docker rm -f wgx pr >/dev/null 2>&1
+          echo PATCHFIX_DONE
