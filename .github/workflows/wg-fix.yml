@@ -1,0 +1,70 @@
+name: wg-fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: A. host-native wireguard baseline
+        run: |
+          set +e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools iptables >/dev/null 2>&1
+          sudo modprobe wireguard
+          sudo ip link add wghost type wireguard; echo "host_add rc=$?"
+          sudo ip link del wghost 2>/dev/null
+          mkdir -p /tmp/hwg && sudo wg genkey | sudo tee /tmp/hwg/k >/dev/null
+          sudo sh -c 'printf "[Interface]\nAddress = 10.9.0.1/24\nListenPort = 51899\nPrivateKey = %s\n" "$(cat /tmp/hwg/k)" > /etc/wireguard/wgtest.conf'
+          sudo wg-quick up wgtest; echo "host_up rc=$?"
+          sudo wg show; echo "host_show rc=$?"
+          sudo wg-quick down wgtest; echo "host_down rc=$?"
+
+      - name: B. rebuild image with bash as /bin/sh
+        run: |
+          set -e
+          docker pull -q ghcr.io/wg-easy/wg-easy:14 >/dev/null
+          docker run -d --name base --privileged --entrypoint sh ghcr.io/wg-easy/wg-easy:14 -c 'sleep 120' >/dev/null
+          sleep 3
+          docker cp base:/usr/bin/wg-quick /tmp/wq
+          sed -i 's|^SELF=.*readlink.*$|SELF="/usr/bin/wg-quick"|' /tmp/wq
+          sed -i 's|^\s*CONFIG_FILE="\$(readlink -f "\$CONFIG_FILE")"\s*$|\tCONFIG_FILE="$CONFIG_FILE"|' /tmp/wq
+          sed -i 's|^\s*(((.*stat -c .*$|\t: # perm check removed|' /tmp/wq
+          grep -n 'readlink\|stat -c' /tmp/wq || echo "(clean)"
+          docker cp /tmp/wq base:/usr/bin/wg-quick
+          docker exec base chmod 755 /usr/bin/wg-quick
+          echo "=== replace /bin/sh with bash ==="
+          docker exec base /bin/busybox ln -sf /bin/bash /bin/sh
+          docker exec base /bin/busybox ls -l /bin/sh
+          echo "=== test exec via node now ==="
+          docker exec base /bin/bash -c 'mkdir -p /etc/wireguard && umask 077 && printf "[Interface]\nAddress = 10.8.0.1/24\nListenPort = 51820\nPrivateKey = %s\n" "$(wg genkey)" > /etc/wireguard/wg0.conf'
+          docker exec base node -e "try{console.log(require('child_process').execSync('wg-quick up wg0').toString())}catch(e){console.log('ERR',e.status,e.message.split('\n').slice(0,2).join('|'))}"
+          docker exec base wg show 2>&1 | head -6
+          echo "=== commit ==="
+          docker commit base wgfix:1 >/dev/null && echo committed
+          docker rm -f base >/dev/null 2>&1
+
+      - name: C. full wg-easy on patched image
+        run: |
+          set +e
+          PW=DemoWG2026
+          HASH=$(docker run --rm --entrypoint node wgfix:1 -e "console.log(require('bcryptjs').hashSync(process.argv[1],10))" "$PW")
+          docker rm -f wgf >/dev/null 2>&1
+          docker run -d --name wgf --privileged \
+            -e "WG_HOST=demo.example.com" -e "PASSWORD_HASH=$HASH" \
+            -e WG_DEFAULT_DNS=1.1.1.1 -e WG_MTU=1280 -e WG_PORT=51820 \
+            -p 51821:51821/tcp -p 51820:51820/udp \
+            wgfix:1 >/dev/null
+          for i in $(seq 1 30); do
+            c=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:51821/ 2>/dev/null)
+            echo "probe $i -> $c"
+            [ "$c" = "200" ] && break
+            sleep 3
+          done
+          echo "=== status: $(docker inspect -f '{{.State.Status}}' wgf) ==="
+          echo "=== logs ==="; docker logs wgf 2>&1 | tail -14
+          echo "=== wg show ==="; docker exec wgf wg show 2>&1 | head -8
+          docker rm -f wgf >/dev/null 2>&1
+          echo FIX_DONE
